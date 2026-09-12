@@ -1,0 +1,45 @@
+Backport test harness dependencies from the upstream reliability and TLS fixes.
+All crate versions were already present in the released lockfile.
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 97ce7a32..4b6a3b7f 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3677,12 +3677,15 @@ dependencies = [
+  "http-body-util",
+  "hyper",
+  "hyper-util",
++ "libc",
+  "nostr",
+  "nostr-sdk",
+  "reqwest",
++ "rustls",
+  "serde_json",
+  "tempfile",
+  "tokio",
++ "tokio-tungstenite",
+ ]
+
+ [[package]]
+diff --git a/test_harness/Cargo.toml b/test_harness/Cargo.toml
+index 44138bb1..d784ce80 100644
+--- a/test_harness/Cargo.toml
++++ b/test_harness/Cargo.toml
+@@ -23,9 +23,15 @@ nostr-sdk = { version = "0.45.2", features = ["local-relay"] }
+ serde_json = "1.0.151"
+ tempfile = "3.27"
+ tokio = { version = "1.53.1", features = ["full"] }
++tokio-tungstenite = "0.28"
++
++[target.'cfg(unix)'.dependencies]
++libc = "0.2"
+
+ [dev-dependencies]
+ # Drives the Blossom fixture's own tests through the same HTTP client ngit
+ # uses, so the fixture's socket-level behaviour is asserted as reqwest sees it.
+-# Loopback HTTP needs no TLS backend.
+-reqwest = { version = "0.13.4", default-features = false, features = ["charset", "http2", "json"] }
++# Match ngit's TLS feature even when these tests run without the root package.
++# Workspace feature unification otherwise enables it only in workspace runs.
++reqwest = { version = "0.13.4", default-features = false, features = ["charset", "http2", "json", "rustls-no-provider"] }
++rustls = { version = "0.23.43", default-features = false, features = ["ring", "std"] }

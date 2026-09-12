@@ -1,0 +1,1124 @@
+Backport shared fixture ownership and deterministic timeout checks.
+Includes the merged TLS initialization fix for harness workspace tests.
+Upstream PRs:
+https://gitworkshop.dev/nevent1qqswkyflsst8ynf926gqf87m69mlt7rxd4r4v033wrt5cy0rg49rspqpz3mhxue69uhhyetvv9ujumn8d96zuer9wck5264n
+https://gitworkshop.dev/nevent1qqsyurm4sw9e04eu8vgs304h76jazwhqzr8q35dtz6wzjcjrycfxplcpz3mhxue69uhhyetvv9ujumn8d96zuer9wcqnecre
+
+diff --git a/src/lib/blossom.rs b/src/lib/blossom.rs
+index 03666b41..ab38ba5a 100644
+--- a/src/lib/blossom.rs
++++ b/src/lib/blossom.rs
+@@ -769,12 +769,30 @@ async fn upload_snapshot_with_authorization_inner(
+
+ async fn send_upload_request_with_progress_timeout(
+     request: reqwest::RequestBuilder,
+-    mut activity: tokio::sync::mpsc::UnboundedReceiver<u64>,
++    activity: tokio::sync::mpsc::UnboundedReceiver<u64>,
+     deadline: tokio::time::Instant,
+     idle_timeout: Duration,
+     total_bytes: u64,
+ ) -> std::result::Result<reqwest::Response, BlobRequestError> {
+-    let request = request.send();
++    monitor_upload_progress(
++        request.send(),
++        activity,
++        deadline,
++        idle_timeout,
++        total_bytes,
++    )
++    .await
++}
++
++// Keep timeout policy independent of socket scheduling so its clock boundaries
++// can be exercised with deterministic request futures.
++async fn monitor_upload_progress<T>(
++    request: impl std::future::Future<Output = reqwest::Result<T>>,
++    mut activity: tokio::sync::mpsc::UnboundedReceiver<u64>,
++    deadline: tokio::time::Instant,
++    idle_timeout: Duration,
++    total_bytes: u64,
++) -> std::result::Result<T, BlobRequestError> {
+     tokio::pin!(request);
+     let total_timer = tokio::time::sleep_until(deadline);
+     tokio::pin!(total_timer);
+@@ -3912,8 +3930,87 @@ mod tests {
+         Ok(())
+     }
+
+-    #[tokio::test]
++    #[tokio::test(start_paused = true)]
+     async fn steadily_progressing_upload_can_outlive_the_idle_timeout() -> Result<()> {
++        let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
++        let (complete_tx, complete_rx) = oneshot::channel();
++        let request =
++            async { Ok::<_, reqwest::Error>(complete_rx.await.expect("complete request")) };
++        let started = tokio::time::Instant::now();
++        let upload = monitor_upload_progress(
++            request,
++            activity_rx,
++            started + Duration::from_secs(2),
++            Duration::from_millis(80),
++            5,
++        );
++        tokio::pin!(upload);
++        assert!(futures::poll!(&mut upload).is_pending());
++        for sent in 1..=5 {
++            tokio::time::advance(Duration::from_millis(40)).await;
++            activity_tx.send(sent)?;
++            // Consume each progress notification before advancing the clock.
++            assert!(futures::poll!(&mut upload).is_pending());
++        }
++        assert!(started.elapsed() > Duration::from_millis(80));
++        complete_tx.send(()).expect("request receiver remains open");
++        upload.await?;
++        Ok(())
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn upload_idle_timeout_restarts_from_last_progress() -> Result<()> {
++        let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
++        let upload = monitor_upload_progress(
++            std::future::pending::<reqwest::Result<()>>(),
++            activity_rx,
++            tokio::time::Instant::now() + Duration::from_secs(2),
++            Duration::from_millis(80),
++            5,
++        );
++        tokio::pin!(upload);
++        assert!(futures::poll!(&mut upload).is_pending());
++        tokio::time::advance(Duration::from_millis(40)).await;
++        activity_tx.send(1)?;
++        assert!(futures::poll!(&mut upload).is_pending());
++        // Closing the body channel must not disable the response idle timeout.
++        drop(activity_tx);
++        assert!(futures::poll!(&mut upload).is_pending());
++        tokio::time::advance(Duration::from_millis(79)).await;
++        assert!(futures::poll!(&mut upload).is_pending());
++        tokio::time::advance(Duration::from_millis(1)).await;
++        let error = upload.await.unwrap_err();
++        assert!(format!("{error:#}").contains("no progress"));
++        assert!(format!("{error:#}").contains("1/5 bytes"));
++        Ok(())
++    }
++
++    #[tokio::test(start_paused = true)]
++    async fn upload_progress_cannot_extend_the_total_timeout() -> Result<()> {
++        let (activity_tx, activity_rx) = tokio::sync::mpsc::unbounded_channel();
++        let upload = monitor_upload_progress(
++            std::future::pending::<reqwest::Result<()>>(),
++            activity_rx,
++            tokio::time::Instant::now() + Duration::from_millis(200),
++            Duration::from_millis(80),
++            5,
++        );
++        tokio::pin!(upload);
++        assert!(futures::poll!(&mut upload).is_pending());
++        for sent in 1..=4 {
++            tokio::time::advance(Duration::from_millis(40)).await;
++            activity_tx.send(sent)?;
++            assert!(futures::poll!(&mut upload).is_pending());
++        }
++        tokio::time::advance(Duration::from_millis(40)).await;
++        let error = upload.await.unwrap_err();
++        assert!(format!("{error:#}").contains("total timeout"));
++        assert!(format!("{error:#}").contains("4/5 bytes"));
++        Ok(())
++    }
++
++    #[tokio::test]
++    async fn streamed_upload_retains_all_bytes() -> Result<()> {
+         let (server_url, server) = spawn_one_shot_server(|_| TestResponse {
+             status: "200 OK",
+             headers: Vec::new(),
+@@ -3926,7 +4023,6 @@ mod tests {
+             if chunk == chunk_count {
+                 return None;
+             }
+-            tokio::time::sleep(Duration::from_millis(40)).await;
+             let sent = chunk + 1;
+             let _ = activity.send(sent);
+             Some((Ok::<Vec<u8>, std::io::Error>(vec![b'x']), (sent, activity)))
+@@ -3939,8 +4035,8 @@ mod tests {
+         send_upload_request_with_progress_timeout(
+             request,
+             activity_rx,
+-            tokio::time::Instant::now() + Duration::from_secs(2),
+-            Duration::from_millis(80),
++            tokio::time::Instant::now() + SERVER_TIMEOUT,
++            IDLE_TIMEOUT,
+             chunk_count,
+         )
+         .await?;
+@@ -4759,21 +4855,32 @@ mod tests {
+             let _ = headers_sent.send(());
+             std::future::pending::<Result<()>>().await
+         });
+-        let signer = NgitSigner::Keys(Keys::generate());
+-        let upload =
+-            upload_snapshot_with_timeout(&server_url, &snapshot, &signer, Duration::from_secs(1));
+-        tokio::pin!(upload);
+-
+-        tokio::select! {
+-            result = &mut upload => {
+-                server.abort();
+-                bail!("upload completed before the partial descriptor was observed: {result:?}");
+-            }
+-            observed = tokio::time::timeout(SERVER_TIMEOUT, headers_received) => {
+-                observed.context("timed out waiting for partial descriptor")??;
+-            }
+-        }
+-        let error = upload.await.unwrap_err();
++        // Establish the real HTTP response before testing its logical deadline;
++        // signing and socket scheduling must not race a one-second test timer.
++        let response = tokio::time::timeout(
++            SERVER_TIMEOUT,
++            blossom_streaming_http_client()?
++                .put(format!("{server_url}/upload"))
++                .body("release")
++                .send(),
++        )
++        .await
++        .context("timed out receiving descriptor headers")??;
++        tokio::time::timeout(SERVER_TIMEOUT, headers_received)
++            .await
++            .context("timed out observing partial descriptor")?
++            .context("partial descriptor observed")?;
++        tokio::time::pause();
++        let read = read_store_response(
++            response,
++            &snapshot,
++            tokio::time::Instant::now() + Duration::from_secs(1),
++            "upload",
++        );
++        tokio::pin!(read);
++        assert!(futures::poll!(&mut read).is_pending());
++        tokio::time::advance(Duration::from_secs(1)).await;
++        let error = read.await.unwrap_err();
+         assert!(format!("{error:#}").contains("total timeout"));
+         server.abort();
+         let _ = (&mut server).await;
+diff --git a/test_harness/src/blossom.rs b/test_harness/src/blossom.rs
+index f25222ab..68449ae8 100644
+--- a/test_harness/src/blossom.rs
++++ b/test_harness/src/blossom.rs
+@@ -904,6 +904,11 @@ mod tests {
+     const BLOB: &[u8] = b"deterministic blossom fixture blob\n";
+
+     fn client() -> reqwest::Client {
++        // Reqwest initializes TLS even for loopback HTTP. Match ngit's Ring
++        // selection, preserving any provider installed by an earlier caller.
++        if rustls::crypto::CryptoProvider::get_default().is_none() {
++            let _ = rustls::crypto::ring::default_provider().install_default();
++        }
+         // Mirrors the parts of ngit's Blossom client which decide what a
+         // failure looks like: no redirect following, bounded idle reads.
+         reqwest::Client::builder()
+diff --git a/test_harness/src/grasp.rs b/test_harness/src/grasp.rs
+index 70cae323..7b4618a3 100644
+--- a/test_harness/src/grasp.rs
++++ b/test_harness/src/grasp.rs
+@@ -35,10 +35,7 @@ use std::{
+ use anyhow::{Context, Result, bail};
+ use nostr_sdk::prelude::*;
+ use tempfile::TempDir;
+-use tokio::{
+-    io::{AsyncReadExt, AsyncWriteExt},
+-    time::sleep,
+-};
++use tokio::{io::AsyncWriteExt, time::sleep};
+
+ use crate::{
+     port::{self, PortReservation},
+@@ -49,22 +46,11 @@ use crate::{
+ const READY_TIMEOUT: Duration = Duration::from_secs(15);
+ /// Poll interval for the readiness probe.
+ const READY_POLL: Duration = Duration::from_millis(100);
+-/// Tiny grace period after the first successful HTTP probe, mirroring the
+-/// upstream pattern.
+-const READY_GRACE: Duration = Duration::from_millis(100);
+ /// Per-attempt timeout for the HTTP readiness probe once TCP connects.
+ const READY_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+-/// How many fresh port reservations to attempt before giving up. The
+-/// subprocess binds itself from `NGIT_BIND_ADDRESS`, so there is a
+-/// microsecond-scale TOCTOU window between [`PortReservation::release`]
+-/// and the subprocess's own `bind`. If that window loses the race the
+-/// subprocess exits before its TCP listener accepts, and our readiness
+-/// check picks that up via `try_wait` so we can retry on a fresh port
+-/// instead of hanging for the full 15s readiness timeout.
+-///
+-/// In practice this loop has never been observed to fire in local
+-/// stress testing — kept as defense-in-depth for CI / loaded hardware.
+-/// Matches the cap in `relay.rs`.
++/// Compatibility limit for older Grasp binaries that bind their own port.
++/// Binaries supporting listener handoff retain the socket and never retry an
++/// early exit: such an exit is a startup error, not a possible bind race.
+ const MAX_BIND_ATTEMPTS: usize = 5;
+
+ /// A spawned `ngit-grasp` subprocess plus the tempdir holding its git data.
+@@ -93,19 +79,8 @@ impl GraspServer {
+     /// Spawn ngit-grasp on the port held by `reservation`, wait for it to
+     /// be ready, then return.
+     ///
+-    /// The reservation is released (its `TcpListener` dropped) immediately
+-    /// before `Command::spawn()`, so no other `reserve_port` call in this
+-    /// process can be handed the same port while ngit-grasp is starting
+-    /// up. There is a small TOCTOU window between release and the
+-    /// subprocess's own `bind` — passing a pre-bound fd into a subprocess
+-    /// would close it entirely, but isn't worth the Unix-specific
+-    /// `pre_exec` plumbing for a residual race that hasn't been observed
+-    /// in local stress testing.
+-    ///
+-    /// If the subprocess exits before becoming ready (the signature of
+-    /// having lost the bind race), we retry with a fresh reservation up
+-    /// to [`MAX_BIND_ATTEMPTS`] times. Defense-in-depth — never observed
+-    /// to fire locally; kept for CI / loaded hardware.
++    /// New Grasp binaries inherit the reserved listener on Unix. Older binaries
++    /// retain the bounded release-and-retry fallback for compatibility.
+     pub(crate) async fn start(
+         role: impl Into<String>,
+         reservation: PortReservation,
+@@ -126,7 +101,7 @@ impl GraspServer {
+     /// (`NGIT_GRASP06_ENABLE=true`).
+     ///
+     /// Identical to [`start`][Self::start] in every other respect: same
+-    /// port reservation logic, same retry-on-early-exit loop, same GRASP-01
++    /// port reservation logic, same listener handoff, same GRASP-01
+     /// relay surface. The only difference is the additional env var that
+     /// opts the process into serving
+     /// `/prs/<npub>/<percent-encoded-identifier>.git` as described in
+@@ -197,7 +172,9 @@ impl GraspServer {
+             .await
+             {
+                 Ok(server) => return Ok(server),
+-                Err(StartFailure::EarlyExit { status }) if attempt < MAX_BIND_ATTEMPTS => {
++                Err(StartFailure::EarlyExit { status })
++                    if attempt < MAX_BIND_ATTEMPTS && !supports_listener_handoff(&binary) =>
++                {
+                     eprintln!(
+                         "[test_harness] ngit-grasp exited early on attempt \
+                          {attempt}/{MAX_BIND_ATTEMPTS} (status: {status:?}); \
+@@ -284,11 +261,30 @@ impl GraspServer {
+                 .env("NGIT_PRIVATE_PUBLIC_ORIGIN", &url);
+         }
+
+-        // Release the port reservation immediately before spawning the
+-        // subprocess that will bind it. Holding the reservation through
+-        // env-var setup above is what keeps any concurrent
+-        // `reserve_port()` calls from picking this same number.
+-        let _ = reservation.release();
++        // Keep the bound socket through exec when the binary supports it.
++        // Only older binaries need the release-and-bind compatibility path.
++        let inherited_listener = if supports_listener_handoff(binary) {
++            Some(reservation.into_std_listener())
++        } else {
++            let _ = reservation.release();
++            None
++        };
++        #[cfg(unix)]
++        if let Some(listener) = &inherited_listener {
++            use std::os::{fd::AsRawFd, unix::process::CommandExt};
++            let fd = listener.as_raw_fd();
++            cmd.env("NGIT_TEST_LISTENER_FD", fd.to_string());
++            // SAFETY: fcntl is async-signal-safe and the listener stays owned
++            // in the parent through spawn. Only the child's descriptor changes.
++            unsafe {
++                cmd.pre_exec(move || {
++                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
++                        return Err(std::io::Error::last_os_error());
++                    }
++                    Ok(())
++                });
++            }
++        }
+
+         let process = cmd
+             .spawn()
+@@ -338,7 +334,7 @@ impl GraspServer {
+                 Ok(_) => {
+                     // HTTP service handled a request successfully, so the
+                     // accept loop, Hyper service, and relay wiring are ready.
+-                    sleep(READY_GRACE).await;
++
+                     return Ok(());
+                 }
+                 Err(_) if Instant::now() < deadline => {
+@@ -367,8 +363,10 @@ impl GraspServer {
+             );
+             stream.write_all(request.as_bytes()).await?;
+
+-            let mut response = [0_u8; 64];
+-            let read = stream.read(&mut response).await?;
++            let mut response = Vec::new();
++            let mut reader = tokio::io::BufReader::new(stream);
++            let read =
++                tokio::io::AsyncBufReadExt::read_until(&mut reader, b'\n', &mut response).await?;
+             if read == 0 {
+                 return Err(std::io::Error::new(
+                     std::io::ErrorKind::UnexpectedEof,
+@@ -625,3 +623,28 @@ fn locate_binary() -> Result<PathBuf> {
+         sibling.display()
+     );
+ }
++
++/// Probe the private protocol once per binary path. Older released binaries
++/// reject this flag and continue to use the compatibility startup path.
++fn supports_listener_handoff(binary: &Path) -> bool {
++    if !cfg!(unix) {
++        return false;
++    }
++    static SUPPORT: std::sync::OnceLock<
++        std::sync::Mutex<std::collections::HashMap<PathBuf, bool>>,
++    > = std::sync::OnceLock::new();
++    let mut cache = SUPPORT
++        .get_or_init(Default::default)
++        .lock()
++        .expect("listener support cache");
++    *cache.entry(binary.to_path_buf()).or_insert_with(|| {
++        Command::new(binary)
++            .arg("--internal-test-listener-support")
++            .env_remove("NGIT_TEST_LISTENER_FD")
++            .stdin(Stdio::null())
++            .output()
++            .is_ok_and(|output| {
++                output.status.success() && output.stdout == b"ngit-test-listener-v1\n"
++            })
++    })
++}
+diff --git a/test_harness/src/port.rs b/test_harness/src/port.rs
+index b565a1fa..a1e95d8d 100644
+--- a/test_harness/src/port.rs
++++ b/test_harness/src/port.rs
+@@ -15,30 +15,15 @@
+ //! the failure mode (`Address already in use (os error 98)`) is a hard
+ //! test fail with no useful information for the next debugger.
+ //!
+-//! ngit-grasp's in-process fixtures (`MockRelay`, `SmartGitServer`)
+-//! eliminate the race entirely by **keeping the listener bound** and
+-//! handing it straight to their tokio accept loop. We can't do that here:
+-//! `LocalRelay::run()` binds internally on a port number, and
+-//! `ngit-grasp` is a subprocess that binds itself from `NGIT_BIND_ADDRESS`.
+-//! Neither accepts a pre-bound listener without significant rework
+-//! (rewriting the hyper accept loop, or fd inheritance via `pre_exec`
+-//! respectively).
++//! In-process services consume the bound listener directly. Supported Grasp
++//! subprocesses inherit it, retaining ownership across startup. Compatibility
++//! paths for older binaries and third-party services release immediately before
++//! spawning and retry bind failures; only those paths retain a handoff race.
+ //!
+-//! ## The reservation pattern
+-//!
+-//! Instead, [`reserve_port`] returns a [`PortReservation`] that **holds the
+-//! bound `TcpListener`** until the caller is about to start the real
+-//! service. While any reservation is live, no other call to
+-//! `reserve_port` in this process can be handed the same port — the
+-//! kernel won't reissue a port that is currently bound.
+-//!
+-//! The caller drops the reservation immediately before the real bind,
+-//! shrinking the TOCTOU window from "however long the fixture takes to
+-//! spawn" to "a few microseconds inside the start function". The retry
+-//! loops in `relay.rs` and `grasp.rs` are belt-and-braces for that
+-//! residual window — they have never been observed to fire in our local
+-//! stress testing post-reservation, but the cost is zero when they
+-//! don't.
++//! [`reserve_port`] returns a [`PortReservation`] that holds its listener until
++//! ownership is transferred with [`PortReservation::into_std_listener`]. The
++//! kernel cannot assign that address to another listener while it remains
++//! bound.
+
+ use std::net::{SocketAddr, TcpListener};
+
+@@ -48,17 +33,9 @@ use anyhow::{Context, Result};
+ /// a live `TcpListener` so that no other [`reserve_port`] call in this
+ /// process can be handed the same number.
+ ///
+-/// The reservation is released by:
+-///
+-/// - calling [`PortReservation::release`] to consume the reservation and return
+-///   the port number (preferred — makes the release explicit at the call site),
+-///   or
+-/// - simply dropping the value (also fine, but the release point is then tied
+-///   to lexical scope).
+-///
+-/// The caller should release **immediately** before the consuming service
+-/// performs its own `bind` so that the TOCTOU window between
+-/// reservation-release and service-bind is as small as possible.
++/// Transfer the listener with [`PortReservation::into_std_listener`] whenever
++/// possible. [`PortReservation::release`] exists for services that cannot
++/// accept a listener; those callers must handle a competing bind after release.
+ #[derive(Debug)]
+ pub struct PortReservation {
+     port: u16,
+@@ -74,9 +51,8 @@ impl PortReservation {
+     }
+
+     /// Consume the reservation, dropping the underlying listener and
+-    /// returning the port number. The port is now free for the caller's
+-    /// real service to bind. Prefer this over relying on lexical drop —
+-    /// it makes the release point explicit at the call site.
++    /// returning the port number. Another service may acquire it immediately,
++    /// so callers must handle bind failures. Prefer transferring the listener.
+     pub fn release(self) -> u16 {
+         let port = self.port;
+         // `self` is consumed; the listener inside is dropped here.
+@@ -183,16 +159,14 @@ mod tests {
+         assert_ne!(a.port(), c.port());
+     }
+
+-    /// After `release`, the returned port is actually bindable.
++    /// Transferring ownership preserves the reservation without a rebind gap.
+     #[test]
+-    fn released_port_is_bindable() {
++    fn transferred_listener_keeps_port_reserved() {
+         let reservation = reserve_port().unwrap();
+-        let port = reservation.release();
+-        // The kernel held the port for us until release; immediately after,
+-        // we must be able to bind it again ourselves.
+-        let listener = TcpListener::bind(("127.0.0.1", port))
+-            .expect("port should be bindable immediately after release");
+-        drop(listener);
++        let port = reservation.port();
++        let listener = reservation.into_std_listener();
++        assert_eq!(listener.local_addr().unwrap().port(), port);
++        assert!(TcpListener::bind(listener.local_addr().unwrap()).is_err());
+     }
+
+     #[tokio::test]
+diff --git a/test_harness/src/relay.rs b/test_harness/src/relay.rs
+index 957747d7..b20390df 100644
+--- a/test_harness/src/relay.rs
++++ b/test_harness/src/relay.rs
+@@ -4,43 +4,23 @@
+ //! Accepts arbitrary events with the builder's default `Generic` mode —
+ //! suitable for user metadata (kind 0), relay lists (kind 10002), signer
+ //! connect events, etc. Not a GRASP server (no git smart-http, no repo-only
+-//! filtering); a future PR adds GRASP via subprocess.
++//! filtering); Grasp fixtures use a separate subprocess.
+ //!
+-//! Shutdown is `Drop`-driven: `LocalRelay` is internally an
+-//! `AtomicDestructor`, so the listener thread terminates when every clone
+-//! goes out of scope.
+-
+-use std::{
+-    error::Error,
+-    io,
+-    net::{IpAddr, Ipv4Addr},
+-};
++//! The listener and its connection tasks remain owned until the last fixture
++//! clone drops. Startup transfers the original reservation without rebinding.
++
++use std::sync::Arc;
+
+ use anyhow::{Context, Result};
+ use nostr_sdk::{
+-    error::{Error as SdkError, ErrorKind},
+     local_relay::{LocalRelay, LocalRelayBuilderNip42},
+     prelude::*,
+ };
+
+-use crate::{
+-    port::{self, PortReservation},
+-    query,
+-};
++use crate::{port::PortReservation, query};
+
+-/// How many fresh port reservations to attempt before giving up. The
+-/// reservation pattern in `port.rs` already prevents same-process
+-/// collisions while reservations are held; this retry exists purely to
+-/// cover the microsecond-scale TOCTOU window between
+-/// [`PortReservation::release`] and `LocalRelay::run`'s internal `bind`.
+-///
+-/// In practice this loop has never been observed to fire in local
+-/// stress testing — kept as defense-in-depth for CI / loaded hardware
+-/// where the residual race may surface. Five tries is plenty: each
+-/// retry draws a brand-new kernel-assigned port, so two consecutive
+-/// `AddrInUse` failures would require two independent races back to
+-/// back.
+-const MAX_BIND_ATTEMPTS: usize = 5;
++mod listener;
++use listener::ListenerTask;
+
+ /// A vanilla nostr relay bound to a fixed loopback port.
+ ///
+@@ -51,72 +31,39 @@ const MAX_BIND_ATTEMPTS: usize = 5;
+ pub struct VanillaRelay {
+     role: String,
+     url: String,
+-    /// Held purely for its `Drop` side-effect — `LocalRelay` is an
+-    /// `AtomicDestructor` that shuts the listener down when the last clone
+-    /// is dropped. We never call methods on it after `run()`.
++    /// Keeps the SDK relay state alive for the fixture's connection tasks.
+     #[allow(dead_code)]
+     relay: LocalRelay,
++    _listener: Arc<ListenerTask>,
+ }
+
+ impl VanillaRelay {
+-    /// Start a relay on the port held by `reservation` and run it.
+-    ///
+-    /// The reservation is released (its `TcpListener` dropped) immediately
+-    /// before `LocalRelay::run()` performs its own internal `bind`. This
+-    /// shrinks the TOCTOU window and ensures that no other `reserve_port`
+-    /// call in this process can be handed the same port number while this
+-    /// fixture is starting up.
+-    ///
+-    /// On the off-chance another parallel test grabs the port in the
+-    /// microseconds between release and bind, we retry with a fresh
+-    /// reservation up to [`MAX_BIND_ATTEMPTS`] times. The retry has not
+-    /// been observed to fire in local stress runs — it's defense-in-depth
+-    /// for CI / loaded hardware.
++    /// Transfer the reserved listener into the relay without releasing its
++    /// port.
+     pub(crate) async fn start(
+         role: impl Into<String>,
+-        mut reservation: PortReservation,
++        reservation: PortReservation,
+         nip42: Option<LocalRelayBuilderNip42>,
+     ) -> Result<Self> {
+         let role = role.into();
+-        for attempt in 1..=MAX_BIND_ATTEMPTS {
+-            // Release the reservation right before LocalRelay performs its
+-            // own bind. The two operations are not atomic — `LocalRelay::run`
+-            // takes the port number, not a pre-bound listener — but
+-            // releasing here narrows the gap to microseconds, and parallel
+-            // `reserve_port` calls in this process cannot have been handed
+-            // this port number while we held the reservation.
+-            let port = reservation.release();
+-            let mut builder = LocalRelay::builder()
+-                .addr(IpAddr::V4(Ipv4Addr::LOCALHOST))
+-                .port(port);
+-            if let Some(nip42) = nip42.clone() {
+-                builder = builder.nip42(nip42);
+-            }
+-            let relay = builder.build();
+-            match relay.run().await {
+-                Ok(()) => {
+-                    let url = relay.url().await.to_string();
+-                    return Ok(Self { role, url, relay });
+-                }
+-                Err(e) if is_addr_in_use(&e) && attempt < MAX_BIND_ATTEMPTS => {
+-                    // Lost the race against another parallel test in the
+-                    // post-release window. Get a brand new port from the
+-                    // kernel and try again.
+-                    reservation = port::reserve_port().context(
+-                        "failed to reserve replacement port after AddrInUse on LocalRelay bind",
+-                    )?;
+-                    continue;
+-                }
+-                Err(e) => {
+-                    return Err(anyhow::Error::from(e).context(format!(
+-                        "failed to start LocalRelay (attempt {attempt}/{MAX_BIND_ATTEMPTS})"
+-                    )));
+-                }
+-            }
++        let listener = reservation.into_std_listener();
++        listener
++            .set_nonblocking(true)
++            .context("set relay listener nonblocking")?;
++        let listener = tokio::net::TcpListener::from_std(listener)?;
++        let url = format!("ws://{}", listener.local_addr()?);
++        let mut builder = LocalRelay::builder();
++        if let Some(nip42) = nip42 {
++            builder = builder.nip42(nip42);
+         }
+-        // Unreachable: the loop either returns `Ok` or returns an `Err`
+-        // on the final iteration via the second `Err` arm.
+-        unreachable!("MAX_BIND_ATTEMPTS loop terminated without returning")
++        let relay = builder.build();
++        let task = ListenerTask::start(listener, relay.clone());
++        Ok(Self {
++            role,
++            url,
++            relay,
++            _listener: Arc::new(task),
++        })
+     }
+
+     /// Role label this relay was registered under (e.g. `"default"`).
+@@ -140,11 +87,71 @@ impl VanillaRelay {
+     }
+ }
+
+-/// `true` iff `e` is an I/O `AddrInUse` (EADDRINUSE) — the signature of
+-/// having lost the port-allocation race.
+-fn is_addr_in_use(e: &SdkError) -> bool {
+-    e.kind() == ErrorKind::IO
+-        && e.source()
+-            .and_then(|source| source.downcast_ref::<io::Error>())
+-            .is_some_and(|io_err| io_err.kind() == io::ErrorKind::AddrInUse)
++#[cfg(test)]
++mod tests {
++    use std::{net::TcpListener, time::Duration};
++
++    use tokio::io::AsyncReadExt;
++
++    use super::*;
++    use crate::port::reserve_port;
++
++    #[tokio::test]
++    async fn listener_stays_owned_until_last_relay_clone_drops() {
++        tokio::time::timeout(Duration::from_secs(10), async {
++            let reservation = reserve_port().unwrap();
++            let address = format!("127.0.0.1:{}", reservation.port());
++            let relay = VanillaRelay::start("lifetime", reservation, None)
++                .await
++                .unwrap();
++            assert_eq!(relay.url(), format!("ws://{address}"));
++            assert!(TcpListener::bind(&address).is_err());
++            assert!(relay.events(Filter::new()).await.unwrap().is_empty());
++
++            let clone = relay.clone();
++            drop(relay);
++            assert!(TcpListener::bind(&address).is_err());
++            assert!(clone.events(Filter::new()).await.unwrap().is_empty());
++
++            // Keep an unfinished handshake open: cancelling the fixture must
++            // close accepted connections as well as the listening socket.
++            let mut connection = tokio::net::TcpStream::connect(&address).await.unwrap();
++            drop(clone);
++            let mut byte = [0];
++            match connection.read(&mut byte).await {
++                Ok(0) => {}
++                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
++                result => panic!("connection should close with the last fixture: {result:?}"),
++            }
++        })
++        .await
++        .expect("relay lifecycle must complete within the deadline");
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn parallel_relays_keep_their_original_reserved_addresses() {
++        tokio::time::timeout(Duration::from_secs(15), async {
++            let mut starts = tokio::task::JoinSet::new();
++            for _ in 0..32 {
++                let reservation = reserve_port().unwrap();
++                let port = reservation.port();
++                starts.spawn(async move {
++                    let relay = VanillaRelay::start("parallel", reservation, None)
++                        .await
++                        .unwrap();
++                    assert_eq!(relay.url(), format!("ws://127.0.0.1:{port}"));
++                    assert!(relay.events(Filter::new()).await.unwrap().is_empty());
++                    relay
++                });
++            }
++            let mut relays = Vec::new();
++            while let Some(result) = starts.join_next().await {
++                relays.push(result.unwrap());
++            }
++            let urls: std::collections::HashSet<_> = relays.iter().map(VanillaRelay::url).collect();
++            assert_eq!(urls.len(), 32);
++        })
++        .await
++        .expect("parallel relay startup must complete within the deadline");
++    }
+ }
+diff --git a/test_harness/src/relay/listener.rs b/test_harness/src/relay/listener.rs
+new file mode 100644
+index 00000000..5c0e1697
+--- /dev/null
++++ b/test_harness/src/relay/listener.rs
+@@ -0,0 +1,83 @@
++//! Local relay fixture that owns its listener from allocation through shutdown.
++
++use std::{
++    convert::Infallible,
++    sync::{Arc, Mutex},
++    time::Duration,
++};
++
++use http_body_util::Full;
++use hyper::{Request, Response, body::Bytes, service::service_fn};
++use hyper_util::rt::TokioIo;
++use nostr_sdk::prelude::LocalRelay;
++use tokio::{
++    net::TcpListener,
++    task::{JoinHandle, JoinSet},
++};
++use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
++
++#[derive(Debug)]
++pub(super) struct ListenerTask {
++    task: JoinHandle<()>,
++}
++
++impl ListenerTask {
++    pub(super) fn start(listener: TcpListener, relay: LocalRelay) -> Self {
++        let server = relay;
++        let task = tokio::spawn(async move {
++            let mut connections = JoinSet::new();
++            loop {
++                tokio::select! {
++                    accepted = listener.accept() => {
++                        let (stream, addr) = accepted.expect("accept test relay connection");
++                        let relay = server.clone();
++                        connections.spawn(async move {
++                            let upgrade = Arc::new(Mutex::new(None));
++                            let requested_upgrade = upgrade.clone();
++                            let service = service_fn(move |req: Request<hyper::body::Incoming>| {
++                                let key = req.headers().get("sec-websocket-key").cloned();
++                                let response = if let Some(key) = key {
++                                    let accept = derive_accept_key(key.as_bytes());
++                                    *requested_upgrade.lock().expect("upgrade lock") =
++                                        Some(hyper::upgrade::on(req));
++                                    Response::builder()
++                                        .status(101)
++                                        .header("connection", "upgrade")
++                                        .header("upgrade", "websocket")
++                                        .header("sec-websocket-accept", accept)
++                                } else {
++                                    Response::builder().status(400)
++                                };
++                                async move {
++                                    Ok::<_, Infallible>(response.body(Full::new(Bytes::new())).unwrap())
++                                }
++                            });
++                            let http = hyper::server::conn::http1::Builder::new()
++                                .serve_connection(TokioIo::new(stream), service)
++                                .with_upgrades();
++                            if !matches!(tokio::time::timeout(Duration::from_secs(5), http).await, Ok(Ok(()))) {
++                                return;
++                            }
++                            let upgrade = upgrade.lock().expect("upgrade lock").take();
++                            if let Some(upgrade) = upgrade {
++                                if let Ok(Ok(stream)) = tokio::time::timeout(Duration::from_secs(5), upgrade).await {
++                                    let _ = relay.take_connection(TokioIo::new(stream), addr).await;
++                                }
++                            }
++                        });
++                    }
++                    result = connections.join_next(), if !connections.is_empty() => {
++                        result.expect("connection task").expect("connection task panicked");
++                    }
++                }
++            }
++        });
++        Self { task }
++    }
++}
++
++impl Drop for ListenerTask {
++    fn drop(&mut self) {
++        self.task.abort();
++    }
++}
+diff --git a/test_harness/src/vanilla_git_server.rs b/test_harness/src/vanilla_git_server.rs
+index 7129a3c9..2999b41d 100644
+--- a/test_harness/src/vanilla_git_server.rs
++++ b/test_harness/src/vanilla_git_server.rs
+@@ -89,11 +89,11 @@ use hyper::{
+ use hyper_util::rt::TokioIo;
+ use tempfile::TempDir;
+ use tokio::{
+-    io::{AsyncReadExt, AsyncWriteExt},
++    io::AsyncWriteExt,
+     net::TcpListener,
+     process::Command as TokioCommand,
+     sync::oneshot,
+-    task::JoinHandle,
++    task::{JoinHandle, JoinSet},
+ };
+
+ use crate::port::PortReservation;
+@@ -116,7 +116,7 @@ pub struct VanillaGitServer {
+     nostr_authorization_requests: Arc<AtomicUsize>,
+     /// Shutdown signal sender. `take()`n in `Drop` (and consumed by `stop`).
+     shutdown_tx: Option<oneshot::Sender<()>>,
+-    /// Accept loop join handle. Awaited synchronously in `Drop`.
++    /// Accept loop join handle. Awaited by `stop`, aborted by `Drop`.
+     handle: Option<JoinHandle<()>>,
+     /// Holds the bare repo. Cleaned up on drop.
+     _temp_dir: TempDir,
+@@ -283,6 +283,7 @@ impl VanillaGitServer {
+         let serve_nostr_authorization_requests = Arc::clone(&nostr_authorization_requests);
+
+         let handle: JoinHandle<()> = tokio::spawn(async move {
++            let mut connections = JoinSet::new();
+             loop {
+                 tokio::select! {
+                     accept = listener.accept() => {
+@@ -292,7 +293,7 @@ impl VanillaGitServer {
+                                 let nostr_authorization_requests =
+                                     Arc::clone(&serve_nostr_authorization_requests);
+                                 let io = TokioIo::new(stream);
+-                                tokio::spawn(async move {
++                                connections.spawn(async move {
+                                     let service = service_fn(move |req| {
+                                         let repo = Arc::clone(&repo);
+                                         let nostr_authorization_requests =
+@@ -329,35 +330,19 @@ impl VanillaGitServer {
+                             }
+                         }
+                     }
++                    _ = connections.join_next(), if !connections.is_empty() => {},
+                     _ = &mut shutdown_rx => break,
+                 }
+             }
++            connections.shutdown().await;
+         });
+
+         let url = format!("http://127.0.0.1:{port}");
+
+-        // Readiness probe. The `TcpListener::from_std` above is already in
+-        // a listening state, but the spawned accept loop has not yet been
+-        // polled by the runtime — on `current_thread` `#[tokio::test]`
+-        // executors that matters, because the test calling `start()`
+-        // synchronously then does its first connect (e.g. `git clone`)
+-        // before yielding back to the runtime. Doing one async connect
+-        // here forces the runtime to schedule the accept loop and
+-        // confirms the wire path is live before we return.
+-        //
+-        // Note this is a *liveness* check on the wire, not a hard
+-        // serialisation point — see the multi-thread runtime requirement
+-        // in the module-level docs for why blocking sync git calls from
+-        // the test thread still need a worker thread to be available.
+-        for _ in 0..50 {
+-            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+-                .await
+-                .is_ok()
+-            {
+-                break;
+-            }
+-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+-        }
++        // The listener has remained bound since reservation. Requests can
++        // queue immediately; the runtime drives the accept loop when polled.
++        // Synchronous Git clients still require another runtime worker, as
++        // described in this module's documentation.
+
+         Ok(Self {
+             role,
+@@ -443,7 +428,7 @@ impl VanillaGitServer {
+     }
+
+     /// Explicit shutdown. Equivalent to dropping, but `await`able and
+-    /// surfaces task-join errors. Prefer drop in tests.
++    /// waits for connection tasks to be cancelled. Prefer drop in tests.
+     pub async fn stop(mut self) {
+         if let Some(tx) = self.shutdown_tx.take() {
+             let _ = tx.send(());
+@@ -461,17 +446,9 @@ impl Drop for VanillaGitServer {
+         if let Some(tx) = self.shutdown_tx.take() {
+             let _ = tx.send(());
+         }
+-        // We can't `await` here, and synchronously joining a tokio task
+-        // from a `Drop` impl requires either being inside a multi-thread
+-        // runtime block (`block_in_place`) or accepting a leaked task.
+-        // The accept loop watches `shutdown_rx` and exits promptly once
+-        // signalled; the spawn'd connection handlers are detached and
+-        // will finish on their own. The tempdir cleanup runs unconditionally
+-        // via `_temp_dir`'s own `Drop`.
+-        //
+-        // We deliberately do not `block_on(handle)` here: nested
+-        // block_on inside a `current_thread` runtime panics, which is
+-        // a worse failure mode than a momentarily-lingering task.
++        // Aborting the accept task drops its JoinSet, cancelling every
++        // connection and its kill-on-drop Git child. `stop` also waits for
++        // connection cancellation before returning.
+         if let Some(handle) = self.handle.take() {
+             handle.abort();
+         }
+@@ -592,6 +569,7 @@ impl Service {
+ /// author would assume on a vanilla test server.
+ fn build_git_command(service: Service) -> TokioCommand {
+     let mut cmd = TokioCommand::new("git");
++    cmd.kill_on_drop(true);
+     match service {
+         Service::UploadPack => {
+             cmd.arg("-c")
+@@ -633,7 +611,7 @@ async fn handle_info_refs(
+         .stdout(Stdio::piped())
+         .stderr(Stdio::piped());
+
+-    let mut child = match cmd.spawn() {
++    let child = match cmd.spawn() {
+         Ok(c) => c,
+         Err(e) => {
+             eprintln!(
+@@ -644,22 +622,18 @@ async fn handle_info_refs(
+         }
+     };
+
+-    let mut stdout_buf = Vec::new();
+-    if let Some(mut stdout) = child.stdout.take() {
+-        let _ = stdout.read_to_end(&mut stdout_buf).await;
+-    }
+-    let mut stderr_buf = Vec::new();
+-    if let Some(mut stderr) = child.stderr.take() {
+-        let _ = stderr.read_to_end(&mut stderr_buf).await;
+-    }
+-    if let Ok(status) = child.wait().await {
+-        if !status.success() {
+-            eprintln!(
+-                "[VanillaGitServer] {} --advertise-refs failed: {}",
+-                service.git_subcommand(),
+-                String::from_utf8_lossy(&stderr_buf)
+-            );
++    let output = match child.wait_with_output().await {
++        Ok(output) => output,
++        Err(error) => {
++            eprintln!("[VanillaGitServer] collecting advertisement failed: {error}");
++            return plain_response(StatusCode::INTERNAL_SERVER_ERROR, "git IO failed");
+         }
++    };
++    if !output.status.success() {
++        eprintln!(
++            "[VanillaGitServer] advertisement failed: {}",
++            String::from_utf8_lossy(&output.stderr)
++        );
+     }
+
+     // Smart-HTTP advertisement framing: pkt-line("# service=<name>\n"),
+@@ -670,7 +644,7 @@ async fn handle_info_refs(
+     body.extend_from_slice(format!("{header_len:04x}").as_bytes());
+     body.extend_from_slice(service_line.as_bytes());
+     body.extend_from_slice(b"0000");
+-    body.extend_from_slice(&stdout_buf);
++    body.extend_from_slice(&output.stdout);
+
+     Response::builder()
+         .status(StatusCode::OK)
+@@ -707,7 +681,7 @@ async fn handle_rpc(
+         .stdout(Stdio::piped())
+         .stderr(Stdio::piped());
+
+-    let mut child = match cmd.spawn() {
++    let child = match cmd.spawn() {
+         Ok(c) => c,
+         Err(e) => {
+             eprintln!(
+@@ -718,39 +692,45 @@ async fn handle_rpc(
+         }
+     };
+
+-    if let Some(mut stdin) = child.stdin.take() {
+-        if let Err(e) = stdin.write_all(&body_bytes).await {
+-            eprintln!("[VanillaGitServer] writing stdin to git failed: {e}");
+-        }
+-        drop(stdin);
+-    }
+-
+-    let mut stdout_buf = Vec::new();
+-    if let Some(mut stdout) = child.stdout.take() {
+-        let _ = stdout.read_to_end(&mut stdout_buf).await;
+-    }
+-    let mut stderr_buf = Vec::new();
+-    if let Some(mut stderr) = child.stderr.take() {
+-        let _ = stderr.read_to_end(&mut stderr_buf).await;
+-    }
+-    if let Ok(status) = child.wait().await {
+-        if !status.success() {
+-            eprintln!(
+-                "[VanillaGitServer] {} --stateless-rpc failed: {}",
+-                service.git_subcommand(),
+-                String::from_utf8_lossy(&stderr_buf)
+-            );
++    let output = match collect_git_output(child, &body_bytes).await {
++        Ok(output) => output,
++        Err(error) => {
++            eprintln!("[VanillaGitServer] collecting RPC response failed: {error}");
++            return plain_response(StatusCode::INTERNAL_SERVER_ERROR, "git IO failed");
+         }
++    };
++    if !output.status.success() {
++        eprintln!(
++            "[VanillaGitServer] RPC failed: {}",
++            String::from_utf8_lossy(&output.stderr)
++        );
+     }
+
+     Response::builder()
+         .status(StatusCode::OK)
+         .header("Content-Type", service.result_content_type())
+         .header("Cache-Control", "no-cache")
+-        .body(Full::new(Bytes::from(stdout_buf)))
++        .body(Full::new(Bytes::from(output.stdout)))
+         .unwrap()
+ }
+
++/// Feed input while draining both output pipes so neither pipe can block Git.
++/// Cancelling this future drops the child, whose command enables kill-on-drop.
++async fn collect_git_output(
++    mut child: tokio::process::Child,
++    input: &[u8],
++) -> std::io::Result<std::process::Output> {
++    let stdin = child.stdin.take();
++    let write = async {
++        if let Some(mut stdin) = stdin {
++            stdin.write_all(input).await?;
++        }
++        Ok::<_, std::io::Error>(())
++    };
++    let (_, output) = tokio::try_join!(write, child.wait_with_output())?;
++    Ok(output)
++}
++
+ fn plain_response(status: StatusCode, msg: &'static str) -> Response<Full<Bytes>> {
+     Response::builder()
+         .status(status)
+@@ -994,6 +974,65 @@ mod tests {
+         );
+     }
+
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn stop_closes_active_keep_alive_connections() {
++        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
++
++        let server = VanillaGitServer::start_empty("shutdown", reserve_port().unwrap())
++            .await
++            .unwrap();
++        tokio::time::timeout(std::time::Duration::from_secs(10), async {
++            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", server.port))
++                .await
++                .unwrap();
++            stream
++                .write_all(b"GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n")
++                .await
++                .unwrap();
++            let mut reader = BufReader::new(stream);
++            let mut status = String::new();
++            reader.read_line(&mut status).await.unwrap();
++            assert!(status.starts_with("HTTP/1.1 404"));
++            // Receiving a response proves that the connection task exists;
++            // shutdown must cancel it even though keep-alive remains open.
++            server.stop().await;
++            let mut remaining = Vec::new();
++            reader.read_to_end(&mut remaining).await.unwrap();
++        })
++        .await
++        .expect("shutdown must close accepted connections");
++    }
++
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn git_io_drains_output_while_writing_input() {
++        use std::process::Stdio;
++
++        let directory = TempDir::new().unwrap();
++        let payload = vec![b'x'; 1024 * 1024];
++        let path = directory.path().join("payload");
++        std::fs::write(&path, &payload).unwrap();
++        let child = tokio::process::Command::new("sh")
++            .args(["-c", "cat \"$1\"; cat \"$1\" >&2; cat", "test-io"])
++            .arg(&path)
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped())
++            .kill_on_drop(true)
++            .spawn()
++            .unwrap();
++        let output = tokio::time::timeout(
++            std::time::Duration::from_secs(10),
++            super::collect_git_output(child, &payload),
++        )
++        .await
++        .expect("all three pipes must make progress")
++        .unwrap();
++        assert!(output.status.success());
++        assert_eq!(output.stdout, payload.repeat(2));
++        assert_eq!(output.stderr, payload);
++    }
++
+     /// `start_empty` produces a server whose backing repo has zero refs
+     /// — `ls-remote` succeeds with empty stdout. Liveness probe shape
+     /// for the [`crate::Harness`] integration.
