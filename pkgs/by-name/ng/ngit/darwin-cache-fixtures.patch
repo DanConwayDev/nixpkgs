@@ -1,0 +1,70 @@
+From 63f3d2c9e85949393189decb2b48ceca9ff63011 Mon Sep 17 00:00:00 2001
+From: DanConwayDev <DanConwayDev@protonmail.com>
+Date: Sun, 20 Sep 2026 22:17:06 +0000
+Subject: [PATCH] test(clone): seed private relay caches at the macOS path
+
+The Darwin package check fails the cached-plaintext private clone because
+ProjectDirs reads HOME/Library/Caches/ngit there, ignoring XDG_CACHE_HOME.
+The fixture writes only the XDG path, so the helper misses the plaintext
+and tries to decrypt the deliberately invalid ciphertext instead.
+
+Seed the cache beneath the existing harness HOME on macOS in both the
+private and public clone regressions. The public test otherwise silently
+misses its intended cached-relay coverage. Keep the signer configuration,
+per-test isolation, Linux XDG path and production cache behavior intact.
+
+Both changed integration tests compile and pass on Linux against cached
+dependencies and the clone-cache-first binaries. Those are focused checks,
+not validation of the release package or execution of the macOS branch.
+Rustfmt and whitespace checks pass. Darwin package validation is pending.
+
+Assisted-by: Codex (GPT-6)
+---
+ tests/clone_grasp.rs   | 11 ++++++++++-
+ tests/private_grasp.rs | 11 ++++++++++-
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/tests/clone_grasp.rs b/tests/clone_grasp.rs
+index 6e5a1499..40b53d1d 100644
+--- a/tests/clone_grasp.rs
++++ b/tests/clone_grasp.rs
+@@ -358,7 +358,16 @@ async fn announce_push_then_clone_via_nostr_url_over_grasp() -> Result<()> {
+         nostr_lmdb::NostrLmdb::open(template.path().join("test-global-cache.lmdb")).await?;
+     database.save_event(&private_list).await?;
+     drop(database);
+-    let cache_dir = plaintext_cache.path().join("ngit/private-git-relay-lists");
++    // ProjectDirs ignores XDG_CACHE_HOME on macOS. Keep the existing
++    // sandbox HOME (and its signer configuration), but seed the directory
++    // the child actually reads rather than an unused XDG cache.
++    let cache_dir = if cfg!(target_os = "macos") {
++        harness
++            .home()
++            .join("Library/Caches/ngit/private-git-relay-lists")
++    } else {
++        plaintext_cache.path().join("ngit/private-git-relay-lists")
++    };
+     std::fs::create_dir_all(&cache_dir)?;
+     std::fs::write(
+         cache_dir.join(format!(
+diff --git a/tests/private_grasp.rs b/tests/private_grasp.rs
+index aea8aaca..327cedfb 100644
+--- a/tests/private_grasp.rs
++++ b/tests/private_grasp.rs
+@@ -314,7 +314,16 @@ async fn private_member_can_init_clone_and_push_without_public_repo_events() ->
+         nostr_lmdb::NostrLmdb::open(template.path().join("test-global-cache.lmdb")).await?;
+     database.save_event(&cached_event).await?;
+     drop(database);
+-    let cache_dir = plaintext_cache.path().join("ngit/private-git-relay-lists");
++    // ProjectDirs ignores XDG_CACHE_HOME on macOS. Keep the existing
++    // sandbox HOME (and its signer configuration), but seed the directory
++    // the child actually reads rather than an unused XDG cache.
++    let cache_dir = if cfg!(target_os = "macos") {
++        harness
++            .home()
++            .join("Library/Caches/ngit/private-git-relay-lists")
++    } else {
++        plaintext_cache.path().join("ngit/private-git-relay-lists")
++    };
+     std::fs::create_dir_all(&cache_dir)?;
+     std::fs::write(
+         cache_dir.join(format!(
