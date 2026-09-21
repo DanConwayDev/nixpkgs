@@ -35,11 +35,11 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   src = fetchgit {
     url = "https://ngit.dev/ngit.git";
-    rev = "51b96bbceee41873843a22f78efeccf3447a19fb";
-    hash = "sha256-MZ/JJxf2oXJVVTN7duKolnQ/U4wk+jRl/7vB38DGvoQ=";
+    rev = "a1f87678d4d11fda0aaa71bd071559a4268416ea";
+    hash = "sha256-DUsf7VX0JIEnni8K49gI5hoQq85c1JPR3hyl3i6MDpM=";
   };
 
-  cargoHash = "sha256-YBMYCjeJ7KyCgsjF3KppmhqsjJc9+lwCDQmg29bK+z4=";
+  cargoHash = "sha256-u5sAB7ijrB46tS9xW78EMVom4PH4yTdSSgBEWt1elrU=";
 
   postPatch = lib.optionalString stdenv.hostPlatform.isUnix ''
     # These fixtures create executable scripts after ordinary shebang patching.
