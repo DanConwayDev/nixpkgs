@@ -14,7 +14,7 @@
 
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "ngit-grasp";
-  version = "3.0.3";
+  version = "3.0.4";
 
   __structuredAttrs = true;
 
@@ -24,18 +24,10 @@ rustPlatform.buildRustPackage (finalAttrs: {
   src = fetchgit {
     url = "https://ngit.dev/ngit-grasp.git";
     tag = "v${finalAttrs.version}";
-    hash = "sha256-iBtw3rKKdmm93fjFJXgibRSSwK/NFf9rDrD421JjMqY=";
+    hash = "sha256-Lb/DdfrMsfYnp+aUVGhpLxnNxPTEukUToDpXIteYZp8=";
   };
 
-  cargoHash = "sha256-iDZ00vCz+SjjBw+plhmpoIUCoKvzJhaDrbRPQau72ow=";
-
-  # Test portability and sandbox failure diagnostics; submitted upstream:
-  # https://gitworkshop.dev/nevent1qqswj6egflzl5acvhrx2ld2gv8ucv4k654kyu5rh3sphxkjmgfw9hsqpz3mhxue69uhhyetvv9ujumn8d96zuer9wckj9pcq
-  patches = [
-    ./metrics-platforms.patch
-    ./relay-failure-logs.patch
-    ./darwin-listener.patch
-  ];
+  cargoHash = "sha256-tbYG9Kr+e+MKA9oFR7lwDCq8PNqJyovSobPUGNoeByY=";
 
   postPatch = ''
     # This test creates its fake Git script at runtime, after shebang patching.
