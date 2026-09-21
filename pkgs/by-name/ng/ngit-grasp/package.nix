@@ -29,6 +29,12 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   cargoHash = "sha256-tbYG9Kr+e+MKA9oFR7lwDCq8PNqJyovSobPUGNoeByY=";
 
+  # Backport upstream test synchronization fixes pending the next release.
+  patches = [
+    ./deterministic-dependency-batching.patch
+    ./reconnect-test-readiness.patch
+  ];
+
   postPatch = ''
     # This test creates its fake Git script at runtime, after shebang patching.
     substituteInPlace tests/git_response_streaming.rs \
