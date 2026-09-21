@@ -35,25 +35,11 @@ rustPlatform.buildRustPackage (finalAttrs: {
 
   src = fetchgit {
     url = "https://ngit.dev/ngit.git";
-    tag = "v${finalAttrs.version}";
-    hash = "sha256-rQ8MHewunwJUlza0mMHhxPsfyl3fuNmnltcW4vXqFyM=";
+    rev = "51b96bbceee41873843a22f78efeccf3447a19fb";
+    hash = "sha256-MZ/JJxf2oXJVVTN7duKolnQ/U4wk+jRl/7vB38DGvoQ=";
   };
 
   cargoHash = "sha256-YBMYCjeJ7KyCgsjF3KppmhqsjJc9+lwCDQmg29bK+z4=";
-
-  # Fix state publication and test fixtures; submitted upstream:
-  # https://gitworkshop.dev/nevent1qqsp8p806jlevr82ydlluv9z2q4n5d537rgkz4zay7nxc740pf3wz5cpz3mhxue69uhhyetvv9ujumn8d96zuer9wc82hdt4
-  patches = [
-    ./state-candidate.patch
-  ]
-  ++ lib.optionals (canRunChecks && stdenv.hostPlatform.isUnix) [
-    ./grasp-failure-logs.patch
-    ./fallback-test-deadline.patch
-  ]
-  ++ lib.optionals (canRunChecks && stdenv.hostPlatform.isDarwin) [
-    # The plaintext cache fixtures must follow macOS's non-XDG layout.
-    ./darwin-cache-fixtures.patch
-  ];
 
   postPatch = lib.optionalString stdenv.hostPlatform.isUnix ''
     # These fixtures create executable scripts after ordinary shebang patching.
